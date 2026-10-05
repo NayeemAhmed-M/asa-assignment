@@ -1,6 +1,7 @@
 import logging
+import secrets
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 import httpx
@@ -26,28 +27,37 @@ app = FastAPI(
 )
 
 
+ALLOWED_ORIGINS = {
+    "http://localhost:3000",
+    "http://localhost:8000",
+    "http://localhost:3001",
+    "http://127.0.0.1:8000",
+    "http://127.0.0.1:3000",
+}
+
+
 @app.middleware("http")
 async def cors_middleware(request: Request, call_next):
     response = await call_next(request)
     origin = request.headers.get("origin")
-    if origin:
+    if origin and origin in ALLOWED_ORIGINS:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
     return response
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error("Unhandled exception on %s: %s", request.url, exc)
+    # Log internal details and stack trace on the server for diagnostics
+    logger.error("Unhandled exception on %s: %s\n%s", request.url, exc, traceback.format_exc())
+    # Return sanitized generic error response without leaking stack traces or internal paths
     return JSONResponse(
         status_code=500,
         content={
-            "error": str(exc),
-            "type": type(exc).__name__,
-            "traceback": traceback.format_exc(),
-            "path": str(request.url),
+            "error": "Internal server error",
+            "message": "An unexpected error occurred. Please contact support.",
         },
     )
 
@@ -89,6 +99,10 @@ class ScanCreate(BaseModel):
 class ScanUpdate(BaseModel):
     status: Optional[str] = None
     remediation_notes: Optional[str] = None
+
+
+class ShareCreate(BaseModel):
+    password: Optional[str] = None
 
 
 class ScanOut(BaseModel):
@@ -145,14 +159,11 @@ def register(payload: UserRegister, db: Session = Depends(get_db)):
 
 @app.post("/auth/login")
 def login(payload: UserLogin, db: Session = Depends(get_db)):
-    logger.info("Login attempt — username: %s password: %s", payload.username, payload.password)
+    # Redact password to prevent credential leakage in application logs
+    logger.info("Login attempt for username: %s", payload.username)
     user = db.query(models.User).filter(models.User.username == payload.username).first()
     if not user or not verify_password(payload.password, user.hashed_password):
-        logger.warning(
-            "Failed login — username: '%s' password: '%s'",
-            payload.username,
-            payload.password,
-        )
+        logger.warning("Failed login attempt for username: '%s'", payload.username)
         raise HTTPException(status_code=401, detail="Incorrect username or password")
     token = create_access_token({"sub": user.username})
     return {"access_token": token, "token_type": "bearer"}
@@ -218,7 +229,11 @@ def get_scan(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    scan = db.query(models.ScanResult).filter(models.ScanResult.id == scan_id).first()
+    # Enforce tenant isolation / IDOR protection: verify ownership of scan record
+    scan = db.query(models.ScanResult).filter(
+        models.ScanResult.id == scan_id,
+        models.ScanResult.owner_id == current_user.id,
+    ).first()
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
     return scan
@@ -270,6 +285,108 @@ def delete_scan(
         raise HTTPException(status_code=404, detail="Scan not found")
     db.delete(scan)
     db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Share routes
+# ---------------------------------------------------------------------------
+
+@app.post("/scans/{scan_id}/share")
+def create_share_link(
+    scan_id: int,
+    request: Request,
+    payload: ShareCreate = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    # Default to empty payload if none provided
+    if payload is None:
+        payload = ShareCreate()
+
+    # Verify scan exists and belongs to the current user
+    scan = db.query(models.ScanResult).filter(
+        models.ScanResult.id == scan_id,
+        models.ScanResult.owner_id == current_user.id,
+    ).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    # Generate a cryptographically secure, URL-safe token
+    token = secrets.token_urlsafe(32)
+
+    # Hash the password with bcrypt if one was provided
+    password_hash = None
+    if payload.password:
+        password_hash = get_password_hash(payload.password)
+
+    # Create the share link with a 24-hour expiry window
+    share_link = models.ShareLink(
+        scan_id=scan_id,
+        token=token,
+        password_hash=password_hash,
+        expires_at=datetime.utcnow() + timedelta(hours=24),
+        created_by=current_user.id,
+    )
+    db.add(share_link)
+    db.commit()
+    db.refresh(share_link)
+
+    # Validate Host header against allowed domains to mitigate Host Header Injection & Phishing
+    incoming_host = request.headers.get("host", "localhost:8000")
+    hostname = incoming_host.split(":")[0].lower()
+    trusted_hosts = {"localhost", "127.0.0.1", "testserver", "vulntracker.local"}
+    if hostname in trusted_hosts or hostname.endswith(".internal"):
+        safe_host = incoming_host
+    else:
+        safe_host = "localhost:8000"
+
+    base_url = f"{request.url.scheme}://{safe_host}"
+    share_url = f"{base_url}/share/{token}"
+
+    return {"share_url": share_url}
+
+
+@app.get("/share/{token}")
+def access_shared_scan(
+    token: str,
+    password: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    # Look up the share link by token
+    share_link = db.query(models.ShareLink).filter(
+        models.ShareLink.token == token,
+    ).first()
+
+    # Use a single error message for not-found and expired to prevent token enumeration
+    if not share_link or share_link.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=404, detail="Share link not found or expired")
+
+    # Verify password if the share link is password-protected
+    if share_link.password_hash:
+        if not password:
+            raise HTTPException(status_code=401, detail="Password required")
+        if not verify_password(password, share_link.password_hash):
+            raise HTTPException(status_code=401, detail="Invalid password")
+
+    # Fetch and return the scan data
+    scan = db.query(models.ScanResult).filter(
+        models.ScanResult.id == share_link.scan_id,
+    ).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    return {
+        "id": scan.id,
+        "title": scan.title,
+        "description": scan.description,
+        "severity": scan.severity,
+        "status": scan.status,
+        "cve_id": scan.cve_id,
+        "affected_component": scan.affected_component,
+        "remediation_notes": scan.remediation_notes,
+        "owner_id": scan.owner_id,
+        "created_at": scan.created_at.isoformat(),
+    }
 
 
 # ---------------------------------------------------------------------------

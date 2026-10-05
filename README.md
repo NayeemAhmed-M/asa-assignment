@@ -75,6 +75,33 @@ cd notify
 npm test
 ```
 
+**Docker Container (`app/`)**
+
+A production-grade, multi-stage Dockerfile is provided for the Python FastAPI service:
+
+```bash
+# 1. Build the Docker image
+docker build -t vulntracker-api:latest .
+
+# 2. Run the container as non-root user (port 8000)
+docker run -d --name vulntracker-api -p 8000:8000 vulntracker-api:latest
+
+# 3. Check healthcheck status
+docker inspect --format='{{json .State.Health}}' vulntracker-api
+```
+
+**Kubernetes Deployment (`helm/`)**
+
+A hardened Helm chart is provided under `helm/vulntracker/`:
+
+```bash
+# Validate and dry-run the chart templates
+helm template vulntracker ./helm/vulntracker
+
+# Deploy to Kubernetes cluster
+helm upgrade --install vulntracker ./helm/vulntracker -n vulntracker --create-namespace
+```
+
 ---
 
 ## Your Tasks

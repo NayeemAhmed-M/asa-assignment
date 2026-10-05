@@ -1,0 +1,125 @@
+replicaCount: 2
+
+image:
+  repository: vulntracker-api
+  pullPolicy: IfNotPresent
+  tag: "1.0.0"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: "vulntracker-sa"
+
+podAnnotations: {}
+
+# Hardened Pod Security Context
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+# Hardened Container Security Context
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 8000
+  targetPort: 8000
+
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+  hosts:
+    - host: vulntracker.internal.company.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: vulntracker-tls
+      hosts:
+        - vulntracker.internal.company.com
+
+# Explicit Resource Requests and Limits (prevents resource starvation and DoS)
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+# Liveness and Readiness Probes
+probes:
+  liveness:
+    httpGet:
+      path: /health
+      port: 8000
+    initialDelaySeconds: 15
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readiness:
+    httpGet:
+      path: /health
+      port: 8000
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 2
+
+# Network Policy: strict ingress/egress boundaries
+networkPolicy:
+  enabled: true
+  ingress:
+    # Allow ingress only from ingress-controller namespace/pods
+    fromIngressController: true
+  egress:
+    # Allow DNS resolution
+    allowDNS: true
+    # Allow communication to internal notify service (port 3001)
+    notifyServicePort: 3001
+
+# Secrets Management: integrates with External Secrets Operator (AWS Secrets Manager / Vault)
+externalSecrets:
+  enabled: true
+  secretStoreRef:
+    name: aws-secrets-manager
+    kind: SecretStore
+  targetSecretName: vulntracker-secrets
+  refreshInterval: "1h"
+  data:
+    - secretKey: SECRET_KEY
+      remoteRef:
+        key: "production/vulntracker/api"
+        property: "SECRET_KEY"
+    - secretKey: ADMIN_API_KEY
+      remoteRef:
+        key: "production/vulntracker/api"
+        property: "ADMIN_API_KEY"
+    - secretKey: DATABASE_URL
+      remoteRef:
+        key: "production/vulntracker/api"
+        property: "DATABASE_URL"
+
+env:
+  NOTIFY_SERVICE_URL: "http://notify-service:3001"

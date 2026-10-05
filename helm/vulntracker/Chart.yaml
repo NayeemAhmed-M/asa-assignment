@@ -1,0 +1,13 @@
+apiVersion: v2
+name: vulntracker
+description: Production-grade Helm chart for VulnTracker API service
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - security
+  - vulnerability-management
+  - fastapi
+maintainers:
+  - name: Security Engineering Team
+    email: seceng@example.com

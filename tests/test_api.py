@@ -148,3 +148,73 @@ def test_delete_scan():
 
     resp = client.delete(f"/scans/{scan_id}", headers=auth_headers(token))
     assert resp.status_code == 204
+
+
+# ---------------------------------------------------------------------------
+# Share link tests
+# ---------------------------------------------------------------------------
+
+def _create_scan(token):
+    return client.post("/scans", json={
+        "title": "Shared finding",
+        "severity": "high",
+        "affected_component": "GET /api/data",
+    }, headers=auth_headers(token)).json()["id"]
+
+
+def test_create_share_link():
+    token = register_and_login()
+    scan_id = _create_scan(token)
+    resp = client.post(f"/scans/{scan_id}/share", json={}, headers=auth_headers(token))
+    assert resp.status_code == 200
+    assert "share_url" in resp.json()
+    assert "/share/" in resp.json()["share_url"]
+
+
+def test_access_shared_scan():
+    token = register_and_login()
+    scan_id = _create_scan(token)
+    share_resp = client.post(f"/scans/{scan_id}/share", json={}, headers=auth_headers(token))
+    share_url = share_resp.json()["share_url"]
+    # Extract the token path from the full URL
+    share_token = share_url.split("/share/")[1]
+
+    resp = client.get(f"/share/{share_token}")
+    assert resp.status_code == 200
+    assert resp.json()["title"] == "Shared finding"
+    assert resp.json()["severity"] == "high"
+
+
+def test_share_link_with_password():
+    token = register_and_login()
+    scan_id = _create_scan(token)
+    share_resp = client.post(
+        f"/scans/{scan_id}/share",
+        json={"password": "s3cret"},
+        headers=auth_headers(token),
+    )
+    share_token = share_resp.json()["share_url"].split("/share/")[1]
+
+    # Access without password should fail
+    resp = client.get(f"/share/{share_token}")
+    assert resp.status_code == 401
+
+    # Access with wrong password should fail
+    resp = client.get(f"/share/{share_token}?password=wrong")
+    assert resp.status_code == 401
+
+    # Access with correct password should succeed
+    resp = client.get(f"/share/{share_token}?password=s3cret")
+    assert resp.status_code == 200
+    assert resp.json()["title"] == "Shared finding"
+
+
+def test_share_link_invalid_token():
+    resp = client.get("/share/this-token-does-not-exist")
+    assert resp.status_code == 404
+
+
+def test_share_link_requires_auth_to_create():
+    resp = client.post("/scans/1/share", json={})
+    assert resp.status_code == 403
+
